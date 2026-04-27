@@ -22,3 +22,35 @@ jobs:
 
       - name: Build and test
         run: zig build test
+
+  tag:
+    name: Tag
+    needs: check
+    if: github.event_name == 'push'
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Get version
+        id: get-version
+        run: |
+          version=v$(sed -En 's/ +\.version = \"([0-9.]+)\",/\1/p' build.zig.zon)
+          create_release=$(git ls-remote --exit-code --tags origin $version && echo false || echo true)
+
+          echo version=$version >> "$GITHUB_OUTPUT"
+          echo create-release=$create_release >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        if: steps.get-version.outputs.create-release == 'true'
+        run: |
+          gh release create $tag \
+            --repo "$GITHUB_REPOSITORY" \
+            --notes "btree $tag"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ steps.get-version.outputs.version }}
