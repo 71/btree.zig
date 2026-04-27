@@ -527,6 +527,213 @@ pub fn BTreeMap(
             try testing.expectEqual(null, map.occupiedEntryContext(ks[0], ctx));
         }
 
+        /// Returns the `OccupiedEntry` for the smallest key `>= key`, or `null` if none exists. The
+        /// boolean indicates whether the entry is an exact match.
+        pub inline fn occupiedEntryOrNext(self: *Self, key: K) ?struct { OccupiedEntry, bool } {
+            return self.occupiedEntryOrNextContext(key, implicitContext("occupiedEntryOrNext"));
+        }
+        pub inline fn occupiedEntryOrNextContext(
+            self: *Self,
+            key: K,
+            context: Context,
+        ) ?struct { OccupiedEntry, bool } {
+            return self.occupiedEntryOrNextAdapted(key, context);
+        }
+        pub fn occupiedEntryOrNextAdapted(
+            self: *Self,
+            key: anytype,
+            context: anytype,
+        ) ?struct { OccupiedEntry, bool } {
+            return self.occupiedEntryOr(.next, key, context);
+        }
+
+        /// Returns the `OccupiedEntry` for the largest key `<= key`, or `null` if none exists. The
+        /// boolean indicates whether the entry is an exact match.
+        pub inline fn occupiedEntryOrPrevious(self: *Self, key: K) ?struct { OccupiedEntry, bool } {
+            return self.occupiedEntryOrPreviousContext(key, implicitContext("occupiedEntryOrPrevious"));
+        }
+        pub inline fn occupiedEntryOrPreviousContext(
+            self: *Self,
+            key: K,
+            context: Context,
+        ) ?struct { OccupiedEntry, bool } {
+            return self.occupiedEntryOrPreviousAdapted(key, context);
+        }
+        pub fn occupiedEntryOrPreviousAdapted(
+            self: *Self,
+            key: anytype,
+            context: anytype,
+        ) ?struct { OccupiedEntry, bool } {
+            return self.occupiedEntryOr(.previous, key, context);
+        }
+
+        /// Common implementation of `occupiedEntryOrNext()` and `occupiedEntryOrPrevious()`.
+        fn occupiedEntryOr(
+            self: *Self,
+            dir: enum { next, previous },
+            key: anytype,
+            context: anytype,
+        ) ?struct { OccupiedEntry, bool } {
+            var current = self.root.orNull() orelse return null;
+            var fallback: ?OccupiedEntry = null;
+
+            while (current.asInternal()) |node| {
+                const idx, const found = search(context, node.keys[0..node.len], key);
+                if (found) return .{
+                    .{
+                        .key_ptr = &node.keys[idx],
+                        .value_ptr = &node.values[idx],
+                        .map = self,
+                        .node = current,
+                        .idx = idx,
+                        .gen = self.generation,
+                    },
+                    true,
+                };
+
+                switch (dir) {
+                    .next => if (idx < node.len) {
+                        // `node.keys[idx]` is the smallest key in this node `>= key` (if it
+                        // exists). Any matching key in `children[idx]` would be smaller, so this is
+                        // only a fallback.
+                        fallback = .{
+                            .key_ptr = &node.keys[idx],
+                            .value_ptr = &node.values[idx],
+                            .map = self,
+                            .node = current,
+                            .idx = idx,
+                            .gen = self.generation,
+                        };
+                    },
+                    .previous => if (idx > 0) {
+                        // `node.keys[idx-1]` is the largest key in this node `<= key` (if it
+                        // exists). Any matching key in `children[idx]` would be larger, so this is
+                        // only a fallback.
+                        fallback = .{
+                            .key_ptr = &node.keys[idx - 1],
+                            .value_ptr = &node.values[idx - 1],
+                            .map = self,
+                            .node = current,
+                            .idx = idx - 1,
+                            .gen = self.generation,
+                        };
+                    },
+                }
+
+                current = node.children[idx];
+            }
+
+            const leaf = current.assertLeaf();
+            const idx, const found = search(context, leaf.keys[0..leaf.len], key);
+
+            if (found) return .{
+                .{
+                    .key_ptr = &leaf.keys[idx],
+                    .value_ptr = &leaf.values[idx],
+                    .map = self,
+                    .node = current,
+                    .idx = idx,
+                    .gen = self.generation,
+                },
+                true,
+            };
+
+            switch (dir) {
+                .next => if (idx < leaf.len) {
+                    fallback = .{
+                        .key_ptr = &leaf.keys[idx],
+                        .value_ptr = &leaf.values[idx],
+                        .map = self,
+                        .node = current,
+                        .idx = idx,
+                        .gen = self.generation,
+                    };
+                },
+                .previous => if (idx > 0) {
+                    fallback = .{
+                        .key_ptr = &leaf.keys[idx - 1],
+                        .value_ptr = &leaf.values[idx - 1],
+                        .map = self,
+                        .node = current,
+                        .idx = idx - 1,
+                        .gen = self.generation,
+                    };
+                },
+            }
+
+            return .{ fallback orelse return null, false };
+        }
+
+        test occupiedEntryOrNext {
+            // To keep things simple, only run this test for ascending key types.
+            if (sampleContextIsReversed(C)) return error.SkipZigTest;
+
+            const ks, const vs, const ctx = try testData();
+
+            var map: Self = .empty;
+            defer map.deinit(testing.allocator);
+
+            // Empty map.
+            try testing.expectEqual(null, map.occupiedEntryOrNextContext(ks[0], ctx));
+
+            _ = try map.putContext(testing.allocator, ks[0], vs[0], ctx);
+            _ = try map.putContext(testing.allocator, ks[2], vs[2], ctx);
+
+            // Exact match on `ks[0]`.
+            {
+                const e, const exact = map.occupiedEntryOrNextContext(ks[0], ctx).?;
+
+                try testing.expect(exact);
+                try testing.expectEqual(ks[0], e.key_ptr.*);
+            }
+
+            // `ks[1]` is between `ks[0]` and `ks[2]`; the next key is `ks[2]`.
+            {
+                const e, const exact = map.occupiedEntryOrNextContext(ks[1], ctx).?;
+
+                try testing.expect(!exact);
+                try testing.expectEqual(ks[2], e.key_ptr.*);
+            }
+
+            // `ks[3]` is after all entries.
+            try testing.expectEqual(null, map.occupiedEntryOrNextContext(ks[3], ctx));
+        }
+
+        test occupiedEntryOrPrevious {
+            // To keep things simple, only run this test for ascending key types.
+            if (sampleContextIsReversed(C)) return error.SkipZigTest;
+
+            const ks, const vs, const ctx = try testData();
+
+            var map: Self = .empty;
+            defer map.deinit(testing.allocator);
+
+            // Empty map.
+            try testing.expectEqual(null, map.occupiedEntryOrNextContext(ks[0], ctx));
+
+            _ = try map.putContext(testing.allocator, ks[1], vs[1], ctx);
+            _ = try map.putContext(testing.allocator, ks[3], vs[3], ctx);
+
+            // Exact match on `ks[1]`.
+            {
+                const e, const exact = map.occupiedEntryOrPreviousContext(ks[1], ctx).?;
+
+                try testing.expect(exact);
+                try testing.expectEqual(ks[1], e.key_ptr.*);
+            }
+
+            // `ks[2]` is between `ks[1]` and `ks[3]`; the previous key is `ks[1]`.
+            {
+                const e, const exact = map.occupiedEntryOrPreviousContext(ks[2], ctx).?;
+
+                try testing.expect(!exact);
+                try testing.expectEqual(ks[1], e.key_ptr.*);
+            }
+
+            // `ks[0]` is before all entries.
+            try testing.expectEqual(null, map.occupiedEntryOrPreviousContext(ks[0], ctx));
+        }
+
         /// Returns the `Entry` for `key`.
         ///
         /// If the result is a `VacantEntry`, it may be discarded without calling `insert()`, which

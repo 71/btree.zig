@@ -55,6 +55,16 @@ implementation.
   As well as reverse iteration with `iteratorFromEnd()`, `previous()`, and
   `removeAndMovePrevious()`.
 
+- Lower-bound and upper-bound lookups with `occupiedEntryOrNext()`,
+  `occupiedEntryOrPrevious()`:
+
+  ```zig
+  const entry, const exact = map.occupiedEntryOrNext(key).?;
+
+  if (exact) try testing.expect(entry.key_ptr.* == key)
+  else try testing.expect(entry.key_ptr.* > key);
+  ```
+
 - Allocating operations take a `std.mem.Allocator` as argument.
 
 - Customizable: custom capacity, search strategy, and contexts can be given. All
