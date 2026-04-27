@@ -344,7 +344,99 @@ pub fn BTreeMap(
 
                 return self.map.removeAt(allocator, self.node, self.idx);
             }
+
+            /// Returns an `Iterator` positioned at this entry.
+            pub fn asIterator(self: OccupiedEntry) Iterator {
+                return .{ .node = self.node, .map = self.map, .idx = self.idx, .gen = self.gen };
+            }
+
+            /// Returns the next `OccupiedEntry` in ascending order, or `null` if this is the last.
+            ///
+            /// Any modification to the map (including via the returned entry) invalidates all other
+            /// `OccupiedEntry` values.
+            pub fn next(self: OccupiedEntry) ?OccupiedEntry {
+                assert(self.gen == self.map.generation);
+
+                var it: Iterator = .{ .node = self.node, .map = self.map, .idx = self.idx, .gen = self.gen };
+                it.moveNext();
+                return it.asOccupiedEntry();
+            }
+
+            /// Returns the previous `OccupiedEntry` in ascending order (i.e. the next entry in
+            /// descending order), or `null` if this is the first.
+            ///
+            /// Any modification to the map (including via the returned entry) invalidates all other
+            /// `OccupiedEntry` values.
+            pub fn previous(self: OccupiedEntry) ?OccupiedEntry {
+                assert(self.gen == self.map.generation);
+
+                var it: Iterator = .{ .node = self.node, .map = self.map, .idx = self.idx, .gen = self.gen };
+                it.movePrevious();
+                return it.asOccupiedEntry();
+            }
+
+            test asIterator {
+                const ks, const vs, const ctx = try testData();
+
+                var map: Self = .empty;
+                defer map.deinit(testing.allocator);
+
+                _ = try map.putContext(testing.allocator, ks[0], vs[0], ctx);
+                _ = try map.putContext(testing.allocator, ks[1], vs[1], ctx);
+                _ = try map.putContext(testing.allocator, ks[2], vs[2], ctx);
+
+                // We need the first and last values below, since we also run this test with reversed
+                // iterators.
+                const first_key = map.first().?.key;
+                const last_key = map.last().?.key;
+
+                try testing.expectEqual(first_key, map.firstEntry().?.asIterator().peek().?[0].*);
+                try testing.expectEqual(last_key, map.lastEntry().?.asIterator().peek().?[0].*);
+            }
+
+            test next {
+                const ks, const vs, const ctx = try testData();
+
+                var map: Self = .empty;
+                defer map.deinit(testing.allocator);
+
+                _ = try map.putContext(testing.allocator, ks[0], vs[0], ctx);
+                _ = try map.putContext(testing.allocator, ks[1], vs[1], ctx);
+                _ = try map.putContext(testing.allocator, ks[2], vs[2], ctx);
+
+                // We need the first and last values below, since we also run this test with reversed
+                // iterators.
+                const first_key = map.first().?.key;
+                const last_key = map.last().?.key;
+
+                // Walk forward from first to last using `next()`.
+                var e: OccupiedEntry = map.firstEntry().?;
+                try testing.expectEqual(first_key, e.key_ptr.*);
+
+                e = e.next().?;
+                try testing.expectEqual(ks[1], e.key_ptr.*);
+
+                e = e.next().?;
+                try testing.expectEqual(last_key, e.key_ptr.*);
+
+                try testing.expectEqual(null, e.next());
+
+                // Walk backward from last to first using `previous()`.
+                try testing.expectEqual(last_key, e.key_ptr.*);
+
+                e = e.previous().?;
+                try testing.expectEqual(ks[1], e.key_ptr.*);
+
+                e = e.previous().?;
+                try testing.expectEqual(map.first().?.key, e.key_ptr.*);
+
+                try testing.expectEqual(null, e.previous());
+            }
         };
+
+        test {
+            testing.refAllDecls(OccupiedEntry);
+        }
 
         /// A reference to a vacant slot. Invalidated on mutation.
         pub const VacantEntry = struct {
@@ -840,6 +932,23 @@ pub fn BTreeMap(
                 self.movePreviousUnchecked();
             }
 
+            /// Returns the current position as an `OccupiedEntry`, or `null` if exhausted.
+            ///
+            /// Like other mutating operations, modifying the map via the `OccupiedEntry` will
+            /// invalidate this iterator.
+            pub fn asOccupiedEntry(self: *const Iterator) ?OccupiedEntry {
+                const key_ptr, const value_ptr = self.peek() orelse return null;
+
+                return .{
+                    .key_ptr = key_ptr,
+                    .value_ptr = value_ptr,
+                    .map = self.map,
+                    .node = self.node,
+                    .idx = self.idx,
+                    .gen = self.gen,
+                };
+            }
+
             /// Same as `moveNext()`, but skips the generation check.
             fn moveNextUnchecked(self: *Iterator) void {
                 if (self.node.isNil()) return;
@@ -1013,7 +1122,46 @@ pub fn BTreeMap(
             fn checkGeneration(self: *const Iterator) void {
                 assert(self.gen == self.map.generation);
             }
+
+            test asOccupiedEntry {
+                const ks, const vs, const ctx = try testData();
+
+                var map: Self = .empty;
+                defer map.deinit(testing.allocator);
+
+                // Exhausted iterator returns null.
+                var it = map.iterator();
+                try testing.expectEqual(null, it.asOccupiedEntry());
+
+                _ = try map.putContext(testing.allocator, ks[0], vs[0], ctx);
+                _ = try map.putContext(testing.allocator, ks[1], vs[1], ctx);
+                _ = try map.putContext(testing.allocator, ks[2], vs[2], ctx);
+
+                it = map.iterator();
+
+                // `asOccupiedEntry()` and `peek()` agree on the current position.
+                const key_ptr, const value_ptr = it.peek().?;
+                const e = it.asOccupiedEntry().?;
+
+                try testing.expectEqual(key_ptr, e.key_ptr);
+                try testing.expectEqual(value_ptr, e.value_ptr);
+
+                // After moving next, `asOccupiedEntry()` reflects the new position.
+                it.moveNext();
+                const e2 = it.asOccupiedEntry().?;
+                try testing.expectEqual(ks[1], e2.key_ptr.*);
+
+                // Moving past the end gives null.
+                it.moveNext();
+                it.moveNext();
+
+                try testing.expectEqual(null, it.asOccupiedEntry());
+            }
         };
+
+        test {
+            testing.refAllDecls(Iterator);
+        }
 
         /// Returns an iterator positioned at the first entry. Use `next()` to traverse in
         /// ascending order.
@@ -2310,6 +2458,18 @@ pub fn BTreeMap(
                     const managed: *Managed = .fromUnmanaged(self.unmanaged.map);
                     return self.unmanaged.remove(managed.allocator);
                 }
+
+                pub fn iterator(self: @This()) Managed.Iterator {
+                    return .{ .unmanaged = self.unmanaged.asIterator() };
+                }
+
+                pub fn next(self: @This()) ?Managed.OccupiedEntry {
+                    return .{ .unmanaged = self.unmanaged.next() orelse return null };
+                }
+
+                pub fn previous(self: @This()) ?Managed.OccupiedEntry {
+                    return .{ .unmanaged = self.unmanaged.previous() orelse return null };
+                }
             };
 
             pub const VacantEntry = struct {
@@ -2372,6 +2532,10 @@ pub fn BTreeMap(
 
                 pub fn movePrevious(self: *@This()) void {
                     self.unmanaged.movePrevious();
+                }
+
+                pub fn occupiedEntry(self: *const @This()) ?Managed.OccupiedEntry {
+                    return .{ .unmanaged = self.unmanaged.asOccupiedEntry() orelse return null };
                 }
 
                 pub fn removeAndMoveNext(self: *@This()) Managed.KV {
