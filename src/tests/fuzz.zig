@@ -46,7 +46,8 @@ const Op = union(enum) {
     /// Remove the largest entry with `lastEntry().remove()`.
     remove_last_entry,
 
-    remove_and_advance: struct { skip: u16, remove: u16 },
+    remove_and_move_next: struct { skip: u16, remove: u16 },
+    remove_and_move_previous: struct { skip: u16, remove: u16 },
 
     /// Keep entries whose key is below `ks[threshold]`.
     retain: struct { threshold: u16 },
@@ -292,24 +293,49 @@ fn perform(
             _ = model.entries.pop();
         },
 
-        .remove_and_advance => |args| {
+        .remove_and_move_next => |args| {
             if (map.count() == 0) return;
 
             const skip = args.skip % @as(u16, @intCast(map.count()));
             var it = map.iterator();
 
-            for (0..skip) |_| it.advance();
+            for (0..skip) |_| it.moveNext();
 
             for (0..args.remove) |_| {
                 if (it.peek() == null) break;
 
                 const expected = model.entries.items[skip];
-                const removed = it.removeAndAdvance(allocator);
+                const removed = it.removeAndMoveNext(allocator);
 
                 try testing.expectEqual(.eq, ctx.order(expected.key, removed.key));
                 try testing.expectEqual(expected.value, removed.value);
 
                 _ = model.remove(expected.key, ctx) orelse unreachable;
+            }
+        },
+
+        .remove_and_move_previous => |args| {
+            if (map.count() == 0) return;
+
+            const skip = args.skip % @as(u16, @intCast(map.count()));
+            var it = map.iteratorFromEnd();
+
+            for (0..skip) |_| _ = it.movePrevious();
+
+            var model_idx: usize = model.entries.items.len - 1 - skip;
+            for (0..args.remove) |_| {
+                if (it.peek() == null) break;
+
+                const expected = model.entries.items[model_idx];
+                const removed = it.removeAndMovePrevious(allocator);
+
+                try testing.expectEqual(.eq, ctx.order(expected.key, removed.key));
+                try testing.expectEqual(expected.value, removed.value);
+
+                _ = model.remove(expected.key, ctx) orelse unreachable;
+
+                if (model_idx == 0) break;
+                model_idx -= 1;
             }
         },
 

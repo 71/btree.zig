@@ -36,7 +36,7 @@ implementation.
   }
   ```
 
-- Iteration, including `next()` and `removeAndAdvance()`:
+- Iteration, including `next()` and `removeAndMoveNext()`:
 
   ```zig
   var it = map.iterator();
@@ -45,12 +45,15 @@ implementation.
       const key_ptr, _ = kv;
 
       if (key_ptr.* % 2 == 0) {
-          _ = it.removeAndAdvance(allocator);
+          _ = it.removeAndMoveNext(allocator);
       } else {
-          it.advance();
+          it.moveNext();
       }
   }
   ```
+
+  As well as reverse iteration with `iteratorFromEnd()`, `previous()`, and
+  `removeAndMovePrevious()`.
 
 - Allocating operations take a `std.mem.Allocator` as argument.
 

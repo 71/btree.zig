@@ -790,7 +790,8 @@ pub fn BTreeMap(
 
         /// Iterator over key-value pairs returned by `iterator()`.
         ///
-        /// Yields entries in ascending key order. Invalidated by any mutation of the map.
+        /// Yields entries in ascending key order (with `next()`) or descending key order (with
+        /// `previous()`). Invalidated by any mutation of the map.
         pub const Iterator = struct {
             node: NodePtr,
             map: *Self,
@@ -798,12 +799,18 @@ pub fn BTreeMap(
             gen: Generation,
 
             /// Returns the current key-value pair, or `null` if the end of the map was reached,
-            /// then advances.
+            /// then moves the iterator to the next entry.
             pub fn next(self: *Iterator) ?struct { *K, *V } {
                 const result = self.peek() orelse return null;
+                self.moveNextUnchecked();
+                return result;
+            }
 
-                self.advance();
-
+            /// Returns the current key-value pair, or `null` if the beginning of the map was
+            /// reached, then moves the iterator to the previous entry.
+            pub fn previous(self: *Iterator) ?struct { *K, *V } {
+                const result = self.peek() orelse return null;
+                self.movePreviousUnchecked();
                 return result;
             }
 
@@ -822,14 +829,19 @@ pub fn BTreeMap(
             }
 
             /// Moves the cursor to the next key-value position.
-            pub fn advance(self: *Iterator) void {
+            pub fn moveNext(self: *Iterator) void {
                 self.checkGeneration();
-                self.advanceUnchecked();
+                self.moveNextUnchecked();
             }
 
-            /// Same as `advance()`, but skips the generation check. For use during mutations that
-            /// have already bumped the generation.
-            fn advanceUnchecked(self: *Iterator) void {
+            /// Moves the cursor to the previous key-value position.
+            pub fn movePrevious(self: *Iterator) void {
+                self.checkGeneration();
+                self.movePreviousUnchecked();
+            }
+
+            /// Same as `moveNext()`, but skips the generation check.
+            fn moveNextUnchecked(self: *Iterator) void {
                 if (self.node.isNil()) return;
 
                 if (self.node.asLeaf()) |leaf| {
@@ -865,12 +877,108 @@ pub fn BTreeMap(
                 }
             }
 
-            /// Removes the current entry from the map and advances to the next position. The
-            /// removed key-value pair is returned. May not be called if `peek()` returns `null`.
-            pub fn removeAndAdvance(self: *Iterator, allocator: Allocator) KV {
-                assert(!self.node.isNil()); // May not be called on an exhausted iterator.
+            /// Same as `movePrevious()`, but skips the generation check.
+            fn movePreviousUnchecked(self: *Iterator) void {
+                if (self.node.isNil()) return;
 
+                if (self.node.isLeaf()) {
+                    if (self.idx > 0) {
+                        // More slots in this leaf.
+                        self.idx -= 1;
+                        return;
+                    }
+
+                    // Go up the tree.
+                    var current = self.node;
+
+                    while (current.parent()) |parent| {
+                        if (current.parentIdx() > 0) {
+                            // Switch to the left sibling.
+                            self.node = .internal(parent);
+                            self.idx = current.parentIdx() - 1;
+                            return;
+                        }
+
+                        // We were the leftmost child; keep ascending.
+                        current = .internal(parent);
+                    }
+
+                    // Reached the root coming up; exhausted.
+                    self.node = .nil;
+                } else {
+                    // At an internal node: go to the rightmost leaf of `children[idx]`.
+                    const leaf = self.node.assertInternal().children[self.idx].rightmostLeaf();
+
+                    self.node = .leaf(leaf);
+                    self.idx = leaf.len - 1;
+                }
+            }
+
+            /// Removes the current entry from the map and moves to the next position. The removed
+            /// key-value pair is returned. May not be called if `peek()` returns `null`.
+            pub fn removeAndMoveNext(self: *Iterator, allocator: Allocator) KV {
                 defer self.map.maybeCheckInvariantsNoContext();
+
+                const kv, const pos = self.removeBeforeMove(allocator);
+
+                if (pos) |p| {
+                    const wasInternal = !self.node.isLeaf();
+
+                    self.node = p.node;
+                    self.idx = p.idx;
+
+                    // Step past the predecessor's slot to reach the original successor.
+                    if (wasInternal) self.moveNextUnchecked();
+                } else {
+                    self.node = .nil;
+                    self.idx = 0;
+                }
+
+                self.gen = self.map.generation;
+
+                return kv;
+            }
+
+            /// Removes the current entry from the map and moves to the previous position. The
+            /// removed key-value pair is returned. May not be called if `peek()` returns `null`.
+            pub fn removeAndMovePrevious(self: *Iterator, allocator: Allocator) KV {
+                defer self.map.maybeCheckInvariantsNoContext();
+
+                const kv, const pos = self.removeBeforeMove(allocator);
+
+                if (pos) |p| {
+                    const wasLeaf = self.node.isLeaf();
+
+                    self.node = p.node;
+                    self.idx = p.idx;
+
+                    // `pos` is the successor; move once to reach the predecessor.
+                    if (wasLeaf) self.movePreviousUnchecked();
+
+                    // For internal nodes, `fixAfterRemovalAt()` walks up from the left subtree and
+                    // lands on `internal[idx]`, which is where we want to be.
+                } else {
+                    // No successor: either the map is now empty, or we removed the last entry.
+                    if (self.map.len == 0) {
+                        self.node = .nil;
+                        self.idx = 0;
+                    } else {
+                        // The predecessor of the removed entry is the new last element.
+                        const leaf = self.map.root.orNull().?.rightmostLeaf();
+
+                        self.node = .leaf(leaf);
+                        self.idx = leaf.len - 1;
+                    }
+                }
+
+                self.gen = self.map.generation;
+
+                return kv;
+            }
+
+            /// Removes the current entry, leaving it up to the caller to fix the iterator position.
+            fn removeBeforeMove(self: *Iterator, allocator: Allocator) struct { KV, ?Removal } {
+                assert(!self.node.isNil()); // May not be called on an exhausted iterator.
 
                 self.checkGeneration();
                 self.map.bumpGeneration();
@@ -881,13 +989,12 @@ pub fn BTreeMap(
 
                 self.map.len -= 1;
 
-                // Remove the entry.
                 var kv: KV = undefined;
-                var pos: ?Removal = undefined;
+                var removal: ?Removal = undefined;
 
                 if (node.asLeaf()) |leaf| {
                     kv.key, kv.value = leaf.remove(idx);
-                    pos = self.map.fixAfterRemovalAt(allocator, node, idx);
+                    removal = self.map.fixAfterRemovalAt(allocator, node, idx);
                 } else {
                     const internal = node.assertInternal();
                     kv.key = internal.keys[idx];
@@ -897,24 +1004,10 @@ pub fn BTreeMap(
                     assert(leaf.len >= 1);
 
                     internal.keys[idx], internal.values[idx] = leaf.removeLast();
-                    pos = self.map.fixAfterRemovalAt(allocator, .leaf(leaf), leaf.len);
+                    removal = self.map.fixAfterRemovalAt(allocator, .leaf(leaf), leaf.len);
                 }
 
-                if (pos) |p| {
-                    self.node = p.node;
-                    self.idx = p.idx;
-
-                    // Step past the predecessor's slot to reach the original successor.
-                    if (!node.isLeaf()) self.advanceUnchecked();
-                } else {
-                    self.node = .nil;
-                    self.idx = 0;
-                }
-
-                // Refresh our captured generation to make it possible to keep using this iterator.
-                self.gen = self.map.generation;
-
-                return kv;
+                return .{ kv, removal };
             }
 
             fn checkGeneration(self: *const Iterator) void {
@@ -922,7 +1015,8 @@ pub fn BTreeMap(
             }
         };
 
-        /// Returns an iterator over all the entries in the map.
+        /// Returns an iterator positioned at the first entry. Use `next()` to traverse in
+        /// ascending order.
         pub fn iterator(self: *Self) Iterator {
             const root = self.root.orNull() orelse
                 return .{ .node = .nil, .map = self, .idx = 0, .gen = self.generation };
@@ -932,6 +1026,19 @@ pub fn BTreeMap(
                 return .{ .node = .nil, .map = self, .idx = 0, .gen = self.generation };
 
             return .{ .node = .leaf(leaf), .map = self, .idx = 0, .gen = self.generation };
+        }
+
+        /// Returns an iterator positioned at the last entry. Use `previous()` to traverse in
+        /// descending order.
+        pub fn iteratorFromEnd(self: *Self) Iterator {
+            const root = self.root.orNull() orelse
+                return .{ .node = .nil, .map = self, .idx = 0, .gen = self.generation };
+
+            const leaf = root.rightmostLeaf();
+            if (leaf.len == 0)
+                return .{ .node = .nil, .map = self, .idx = 0, .gen = self.generation };
+
+            return .{ .node = .leaf(leaf), .map = self, .idx = leaf.len - 1, .gen = self.generation };
         }
 
         test iterator {
@@ -962,13 +1069,13 @@ pub fn BTreeMap(
             try testing.expectEqual(last_key, iter.next().?[0].*);
             try testing.expectEqual(null, iter.next());
 
-            // Values can be removed.
+            // Values can be removed going forward.
             iter = map.iterator();
 
             try testing.expectEqual(first_key, iter.next().?[0].*);
 
             try testing.expectEqual(ks[1], iter.peek().?[0].*);
-            try testing.expectEqual(ks[1], iter.removeAndAdvance(testing.allocator).key);
+            try testing.expectEqual(ks[1], iter.removeAndMoveNext(testing.allocator).key);
 
             try testing.expectEqual(last_key, iter.next().?[0].*);
             try testing.expectEqual(null, iter.next());
@@ -978,11 +1085,57 @@ pub fn BTreeMap(
             try testing.expectEqual(first_key, iter.next().?[0].*);
             try testing.expectEqual(last_key, iter.next().?[0].*);
             try testing.expectEqual(null, iter.next());
+
+            // Values can be removed going backward.
+            _ = try map.putContext(testing.allocator, ks[1], vs[1], ctx);
+
+            iter = map.iteratorFromEnd();
+
+            try testing.expectEqual(last_key, iter.peek().?[0].*);
+            try testing.expectEqual(last_key, iter.removeAndMovePrevious(testing.allocator).key);
+
+            try testing.expectEqual(ks[1], iter.peek().?[0].*);
+            try testing.expectEqual(ks[1], iter.removeAndMovePrevious(testing.allocator).key);
+
+            // After removing `ks[1]`, the iterator should be at `first_key`.
+            try testing.expectEqual(first_key, iter.peek().?[0].*);
+
+            // Removing the first entry leaves the iterator exhausted.
+            try testing.expectEqual(first_key, iter.removeAndMovePrevious(testing.allocator).key);
+            try testing.expectEqual(null, iter.peek());
+        }
+
+        test iteratorFromEnd {
+            const ks, const vs, const ctx = try testData();
+
+            var map: Self = .empty;
+            defer map.deinit(testing.allocator);
+
+            var iter = map.iterator();
+
+            try testing.expectEqual(null, iter.previous());
+
+            // Insert keys in arbitrary order.
+            _ = try map.putContext(testing.allocator, ks[0], vs[0], ctx);
+            _ = try map.putContext(testing.allocator, ks[2], vs[2], ctx);
+            _ = try map.putContext(testing.allocator, ks[1], vs[1], ctx);
+
+            const first_key = map.first().?.key;
+            const last_key = map.last().?.key;
+
+            // Results are yielded in descending order.
+            iter = map.iteratorFromEnd();
+
+            try testing.expectEqual(last_key, iter.previous().?[0].*);
+            try testing.expectEqual(ks[1], iter.previous().?[0].*);
+            try testing.expectEqual(first_key, iter.previous().?[0].*);
+            try testing.expectEqual(null, iter.previous());
         }
 
         /// Constant iterator over key-value pairs returned by `constIterator()`.
         ///
-        /// Yields entries in ascending key order. Invalidated by any mutation of the map.
+        /// Yields entries in ascending key order (with `next()`) or descending key order (with
+        /// `previous()`). Invalidated by any mutation of the map.
         pub const ConstIterator = struct {
             iterator: Iterator,
 
@@ -990,6 +1143,26 @@ pub fn BTreeMap(
                 const key_ptr, const value_ptr = self.iterator.next() orelse return null;
 
                 return .{ .key = key_ptr.*, .value = value_ptr.* };
+            }
+
+            pub fn previous(self: *ConstIterator) ?KV {
+                const key_ptr, const value_ptr = self.iterator.previous() orelse return null;
+
+                return .{ .key = key_ptr.*, .value = value_ptr.* };
+            }
+
+            pub fn peek(self: *const ConstIterator) ?KV {
+                const key_ptr, const value_ptr = self.iterator.peek() orelse return null;
+
+                return .{ .key = key_ptr.*, .value = value_ptr.* };
+            }
+
+            pub fn moveNext(self: *ConstIterator) void {
+                self.iterator.moveNext();
+            }
+
+            pub fn movePrevious(self: *ConstIterator) void {
+                self.iterator.movePrevious();
             }
         };
 
@@ -1027,6 +1200,41 @@ pub fn BTreeMap(
             try testing.expectEqual(null, iter.next());
         }
 
+        /// Returns a constant iterator positioned at the last entry. Call `previous()` to traverse
+        /// in descending key order.
+        pub fn constIteratorFromEnd(self: *const Self) ConstIterator {
+            return .{ .iterator = @constCast(self).iteratorFromEnd() };
+        }
+
+        test constIteratorFromEnd {
+            const ks, const vs, const ctx = try testData();
+
+            var map: Self = .empty;
+            defer map.deinit(testing.allocator);
+
+            var iter = map.constIterator();
+
+            try testing.expectEqual(null, iter.previous());
+
+            // Insert keys in arbitrary order.
+            _ = try map.putContext(testing.allocator, ks[0], vs[0], ctx);
+            _ = try map.putContext(testing.allocator, ks[2], vs[2], ctx);
+            _ = try map.putContext(testing.allocator, ks[1], vs[1], ctx);
+
+            // We need the first and last values below, since we also run this test with reversed
+            // iterators.
+            const first_key = map.first().?.key;
+            const last_key = map.last().?.key;
+
+            // Results are yielded in descending order.
+            iter = map.constIteratorFromEnd();
+
+            try testing.expectEqual(last_key, iter.previous().?.key);
+            try testing.expectEqual(ks[1], iter.previous().?.key);
+            try testing.expectEqual(first_key, iter.previous().?.key);
+            try testing.expectEqual(null, iter.previous());
+        }
+
         // -----------------------------------------------------------------------------------------
         // MARK: Retain
 
@@ -1046,9 +1254,9 @@ pub fn BTreeMap(
                 const key_ptr, const value_ptr = kv;
 
                 if (f(context, key_ptr.*, value_ptr)) {
-                    it.advance();
+                    it.moveNext();
                 } else {
-                    _ = it.removeAndAdvance(allocator);
+                    _ = it.removeAndMoveNext(allocator);
                 }
             }
         }
@@ -2150,17 +2358,30 @@ pub fn BTreeMap(
                     return self.unmanaged.next();
                 }
 
+                pub fn previous(self: *@This()) ?struct { *K, *V } {
+                    return self.unmanaged.previous();
+                }
+
                 pub fn peek(self: *const @This()) ?struct { *K, *V } {
                     return self.unmanaged.peek();
                 }
 
-                pub fn advance(self: *@This()) void {
-                    self.unmanaged.advance();
+                pub fn moveNext(self: *@This()) void {
+                    self.unmanaged.moveNext();
                 }
 
-                pub fn removeAndAdvance(self: *@This()) Managed.KV {
+                pub fn movePrevious(self: *@This()) void {
+                    self.unmanaged.movePrevious();
+                }
+
+                pub fn removeAndMoveNext(self: *@This()) Managed.KV {
                     const managed: *Managed = .fromUnmanaged(self.unmanaged.map);
-                    return self.unmanaged.removeAndAdvance(managed.allocator);
+                    return self.unmanaged.removeAndMoveNext(managed.allocator);
+                }
+
+                pub fn removeAndMovePrevious(self: *@This()) Managed.KV {
+                    const managed: *Managed = .fromUnmanaged(self.unmanaged.map);
+                    return self.unmanaged.removeAndMovePrevious(managed.allocator);
                 }
             };
 

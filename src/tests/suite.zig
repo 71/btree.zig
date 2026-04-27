@@ -163,7 +163,7 @@ test "retain: remove even keys" {
 // -------------------------------------------------------------------------------------------------
 // MARK: Iterator invalidation
 
-test "iterator: removeAndAdvance() on first entry" {
+test "iterator: removeAndMoveNext() on first entry" {
     const Map = BTreeMap(u32, u32, AutoContext(u32), .{ .B = 4 });
 
     var map: Map = .empty;
@@ -176,7 +176,7 @@ test "iterator: removeAndAdvance() on first entry" {
     try testing.expectEqual(1, it.peek().?[0].*);
 
     // Remove first entry.
-    const removed = it.removeAndAdvance(testing.allocator);
+    const removed = it.removeAndMoveNext(testing.allocator);
     try testing.expectEqual(1, removed.key);
 
     try testing.expectEqual(2, it.peek().?[0].*);
@@ -184,7 +184,7 @@ test "iterator: removeAndAdvance() on first entry" {
     try expectOrder(&map, &.{ 2, 3, 4, 5, 6, 7 });
 }
 
-test "iterator: removeAndAdvance() on last entry" {
+test "iterator: removeAndMoveNext() on last entry" {
     const Map = BTreeMap(u32, u32, AutoContext(u32), .{ .B = 4 });
 
     var map: Map = .empty;
@@ -198,7 +198,7 @@ test "iterator: removeAndAdvance() on last entry" {
 
     try testing.expectEqual(7, it.peek().?[0].*);
 
-    const removed = it.removeAndAdvance(testing.allocator);
+    const removed = it.removeAndMoveNext(testing.allocator);
     try testing.expectEqual(7, removed.key);
 
     // Cursor must now be exhausted.
@@ -207,7 +207,7 @@ test "iterator: removeAndAdvance() on last entry" {
     try expectOrder(&map, &.{ 1, 2, 3, 4, 5, 6 });
 }
 
-test "iterator: removeAndAdvance() on only entry" {
+test "iterator: removeAndMoveNext() on only entry" {
     const Map = BTreeMap(u32, u32, AutoContext(u32), .{});
 
     var map: Map = .empty;
@@ -216,7 +216,7 @@ test "iterator: removeAndAdvance() on only entry" {
     _ = try map.put(testing.allocator, 42, 42);
 
     var it = map.iterator();
-    const removed = it.removeAndAdvance(testing.allocator);
+    const removed = it.removeAndMoveNext(testing.allocator);
 
     try testing.expectEqual(42, removed.key);
     try testing.expectEqual(null, it.peek());
@@ -224,7 +224,7 @@ test "iterator: removeAndAdvance() on only entry" {
     try testing.expectEqual(null, map.first());
 }
 
-test "iterator: removeAndAdvance() repeatedly" {
+test "iterator: removeAndMoveNext() repeatedly" {
     const Map = BTreeMap(u32, u32, AutoContext(u32), .{ .B = 4 });
 
     var map: Map = .empty;
@@ -236,12 +236,90 @@ test "iterator: removeAndAdvance() repeatedly" {
 
     try testing.expectEqual(1, it.next().?[0].*);
     try testing.expectEqual(2, it.next().?[0].*);
-    try testing.expectEqual(3, it.removeAndAdvance(testing.allocator).value);
-    try testing.expectEqual(4, it.removeAndAdvance(testing.allocator).value);
+    try testing.expectEqual(3, it.removeAndMoveNext(testing.allocator).value);
+    try testing.expectEqual(4, it.removeAndMoveNext(testing.allocator).value);
     try testing.expectEqual(5, it.next().?[0].*);
-    try testing.expectEqual(6, it.removeAndAdvance(testing.allocator).value);
+    try testing.expectEqual(6, it.removeAndMoveNext(testing.allocator).value);
     try testing.expectEqual(7, it.next().?[0].*);
     try testing.expectEqual(null, it.next());
+}
+
+test "iterator: removeAndMovePrevious() on last entry" {
+    const Map = BTreeMap(u32, u32, AutoContext(u32), .{ .B = 4 });
+
+    var map: Map = .empty;
+    defer map.deinit(testing.allocator);
+
+    for ([_]u32{ 1, 2, 3, 4, 5, 6, 7 }) |k| _ = try map.put(testing.allocator, k, k);
+
+    var it = map.iteratorFromEnd();
+
+    try testing.expectEqual(7, it.peek().?[0].*);
+
+    const removed = it.removeAndMovePrevious(testing.allocator);
+    try testing.expectEqual(7, removed.key);
+
+    try testing.expectEqual(6, it.peek().?[0].*);
+
+    try expectOrder(&map, &.{ 1, 2, 3, 4, 5, 6 });
+}
+
+test "iterator: removeAndMovePrevious() on first entry" {
+    const Map = BTreeMap(u32, u32, AutoContext(u32), .{ .B = 4 });
+
+    var map: Map = .empty;
+    defer map.deinit(testing.allocator);
+
+    for ([_]u32{ 1, 2, 3, 4, 5, 6, 7 }) |k| _ = try map.put(testing.allocator, k, k);
+
+    var it = map.iteratorFromEnd();
+    for (0..6) |_| _ = it.previous();
+
+    try testing.expectEqual(1, it.peek().?[0].*);
+
+    const removed = it.removeAndMovePrevious(testing.allocator);
+    try testing.expectEqual(1, removed.key);
+
+    try testing.expectEqual(null, it.peek());
+
+    try expectOrder(&map, &.{ 2, 3, 4, 5, 6, 7 });
+}
+
+test "iterator: removeAndMovePrevious() on only entry" {
+    const Map = BTreeMap(u32, u32, AutoContext(u32), .{});
+
+    var map: Map = .empty;
+    defer map.deinit(testing.allocator);
+
+    _ = try map.put(testing.allocator, 42, 42);
+
+    var it = map.iteratorFromEnd();
+    const removed = it.removeAndMovePrevious(testing.allocator);
+
+    try testing.expectEqual(42, removed.key);
+    try testing.expectEqual(null, it.peek());
+    try testing.expectEqual(0, map.count());
+    try testing.expectEqual(null, map.last());
+}
+
+test "iterator: removeAndMovePrevious() repeatedly" {
+    const Map = BTreeMap(u32, u32, AutoContext(u32), .{ .B = 4 });
+
+    var map: Map = .empty;
+    defer map.deinit(testing.allocator);
+
+    for ([_]u32{ 1, 2, 3, 4, 5, 6, 7 }) |k| _ = try map.put(testing.allocator, k, k);
+
+    var it = map.iteratorFromEnd();
+
+    try testing.expectEqual(7, it.previous().?[0].*);
+    try testing.expectEqual(6, it.previous().?[0].*);
+    try testing.expectEqual(5, it.removeAndMovePrevious(testing.allocator).value);
+    try testing.expectEqual(4, it.removeAndMovePrevious(testing.allocator).value);
+    try testing.expectEqual(3, it.previous().?[0].*);
+    try testing.expectEqual(2, it.removeAndMovePrevious(testing.allocator).value);
+    try testing.expectEqual(1, it.previous().?[0].*);
+    try testing.expectEqual(null, it.previous());
 }
 
 test "iterator: generation bumps on every mutating API" {
@@ -370,7 +448,7 @@ test "iterator: generation bumps on every mutating API" {
         try checker.expectUnchanged();
     }
 
-    // `removeAndAdvance()` refreshes the iterator's own generation so the same iterator stays
+    // `removeAndMoveNext()` refreshes the iterator's own generation so the same iterator stays
     // usable.
     {
         var map: Map = .empty;
@@ -379,7 +457,7 @@ test "iterator: generation bumps on every mutating API" {
 
         var it = map.iterator();
         const before = it.gen;
-        _ = it.removeAndAdvance(testing.allocator);
+        _ = it.removeAndMoveNext(testing.allocator);
 
         try testing.expect(it.gen != before); // Generation changed.
         try testing.expectEqual(map.generation, it.gen); // Iterator is updated.
@@ -390,7 +468,7 @@ test "iterator: generation bumps on every mutating API" {
     }
 }
 
-test "Iterator.removeAndAdvance() across leaf merge" {
+test "Iterator.removeAndMoveNext() across leaf merge" {
     const Map = BTreeMap(u32, u32, AutoContext(u32), .{ .B = 4 });
 
     var map: Map = .empty;
@@ -398,17 +476,37 @@ test "Iterator.removeAndAdvance() across leaf merge" {
 
     for ([_]u32{ 1, 2, 3, 4, 5 }) |k| _ = try map.put(testing.allocator, k, k);
 
-    // Walk the first few entries with `removeAndAdvance()`; at least one removal is guaranteed to
+    // Walk the first few entries with `removeAndMoveNext()`; at least one removal is guaranteed to
     // trigger a merge given the minimum-sized leaves. The cursor fix-up must keep the iterator in
     // the correct in-order position.
     var it = map.iterator();
 
-    try testing.expectEqual(1, it.removeAndAdvance(testing.allocator).key);
-    try testing.expectEqual(2, it.removeAndAdvance(testing.allocator).key);
-    try testing.expectEqual(3, it.removeAndAdvance(testing.allocator).key);
+    try testing.expectEqual(1, it.removeAndMoveNext(testing.allocator).key);
+    try testing.expectEqual(2, it.removeAndMoveNext(testing.allocator).key);
+    try testing.expectEqual(3, it.removeAndMoveNext(testing.allocator).key);
 
     // Whatever remains in the iterator must match the remaining entries in order.
     try expectOrder(&map, &.{ 4, 5 });
+}
+
+test "Iterator.removeAndMovePrevious() across leaf merge" {
+    const Map = BTreeMap(u32, u32, AutoContext(u32), .{ .B = 4 });
+
+    var map: Map = .empty;
+    defer map.deinit(testing.allocator);
+
+    for ([_]u32{ 1, 2, 3, 4, 5 }) |k| _ = try map.put(testing.allocator, k, k);
+
+    // Walk the last few entries with `removeAndMovePrevious()`; at least one removal is guaranteed
+    // to trigger a merge given the minimum-sized leaves. The cursor fix-up must keep the iterator
+    // in the correct in-order position.
+    var it = map.iteratorFromEnd();
+
+    try testing.expectEqual(5, it.removeAndMovePrevious(testing.allocator).key);
+    try testing.expectEqual(4, it.removeAndMovePrevious(testing.allocator).key);
+    try testing.expectEqual(3, it.removeAndMovePrevious(testing.allocator).key);
+
+    try expectOrder(&map, &.{ 1, 2 });
 }
 
 // -------------------------------------------------------------------------------------------------
