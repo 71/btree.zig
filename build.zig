@@ -34,4 +34,19 @@ pub fn build(b: *std.Build) void {
     });
     const build_tests_step = b.step("build-tests", "Build tests");
     build_tests_step.dependOn(&build_tests.step);
+
+    // Benchmarks.
+    const benchmarks = b.addExecutable(.{
+        .name = "benchmarks",
+        .root_module = b.addModule("benchmarks", .{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    benchmarks.root_module.addImport("btree", mod);
+
+    const run_benchmarks = b.addRunArtifact(benchmarks);
+    const run_benchmarks_step = b.step("benchmark", "Run benchmarks");
+    run_benchmarks_step.dependOn(&run_benchmarks.step);
 }
