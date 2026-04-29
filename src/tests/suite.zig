@@ -510,6 +510,127 @@ test "Iterator.removeAndMovePrevious() across leaf merge" {
 }
 
 // -------------------------------------------------------------------------------------------------
+// MARK: Iterator.removeUntil()
+
+test "Iterator.removeUntilAndMoveNext() self == end is a no-op" {
+    const Map = BTreeMap(u32, u32, AutoContext(u32), .{ .B = 4 });
+
+    var map: Map = .empty;
+    defer map.deinit(testing.allocator);
+
+    for ([_]u32{ 1, 2, 3, 4, 5 }) |k| _ = try map.put(testing.allocator, k, k);
+
+    var begin = map.iterator();
+    const end = begin;
+
+    const removed = begin.removeUntilAndMoveNext(testing.allocator, end);
+
+    try testing.expectEqual(0, removed);
+    try testing.expectEqual(1, begin.peek().?[0].*);
+
+    try expectOrder(&map, &.{ 1, 2, 3, 4, 5 });
+}
+
+test "Iterator.removeUntilAndMoveNext() with exhausted end removes to end of map" {
+    const Map = BTreeMap(u32, u32, AutoContext(u32), .{ .B = 4 });
+
+    var map: Map = .empty;
+    defer map.deinit(testing.allocator);
+
+    for ([_]u32{ 1, 2, 3, 4, 5, 6, 7 }) |k| _ = try map.put(testing.allocator, k, k);
+
+    var begin = map.iterator();
+    for (0..2) |_| begin.moveNext();
+
+    var end = map.iterator();
+    for (0..7) |_| end.moveNext();
+    try testing.expectEqual(null, end.peek());
+
+    const removed = begin.removeUntilAndMoveNext(testing.allocator, end);
+
+    try testing.expectEqual(5, removed);
+    try testing.expectEqual(null, begin.peek());
+
+    try expectOrder(&map, &.{ 1, 2 });
+}
+
+test "Iterator.removeUntilAndMoveNext() removes the entire map" {
+    const Map = BTreeMap(u32, u32, AutoContext(u32), .{ .B = 4 });
+
+    var map: Map = .empty;
+    defer map.deinit(testing.allocator);
+
+    for ([_]u32{ 1, 2, 3, 4, 5, 6, 7 }) |k| _ = try map.put(testing.allocator, k, k);
+
+    var begin = map.iterator();
+    var end = map.iterator();
+    for (0..7) |_| end.moveNext();
+
+    const removed = begin.removeUntilAndMoveNext(testing.allocator, end);
+
+    try testing.expectEqual(7, removed);
+    try testing.expectEqual(0, map.count());
+    try testing.expectEqual(null, begin.peek());
+    try testing.expectEqual(null, map.first());
+}
+
+test "Iterator.removeUntilAndMoveNext() from middle to middle" {
+    const Map = BTreeMap(u32, u32, AutoContext(u32), .{ .B = 4 });
+
+    var map: Map = .empty;
+    defer map.deinit(testing.allocator);
+
+    for (1..16) |k| _ = try map.put(testing.allocator, @intCast(k), @intCast(k));
+
+    var begin = map.iterator();
+    for (0..3) |_| begin.moveNext();
+    try testing.expectEqual(4, begin.peek().?[0].*);
+
+    var end = map.iterator();
+    for (0..11) |_| end.moveNext();
+    try testing.expectEqual(12, end.peek().?[0].*);
+
+    const removed = begin.removeUntilAndMoveNext(testing.allocator, end);
+
+    try testing.expectEqual(8, removed);
+    try testing.expectEqual(12, begin.peek().?[0].*);
+}
+
+test "Iterator.removeUpToAndMoveNext() delete all except first two" {
+    const Map = BTreeMap(usize, usize, AutoContext(usize), .{ .B = 4 });
+
+    var map: Map = .empty;
+    defer map.deinit(testing.allocator);
+
+    for (0..10) |i| _ = try map.put(testing.allocator, i, i);
+
+    var begin = map.iterator();
+    begin.moveNext();
+    begin.moveNext();
+
+    try testing.expectEqual(8, begin.removeUpToAndMoveNext(testing.allocator, 1000));
+}
+
+test "Iterator.removeUntilAndMovePrevious() removes the entire map" {
+    const Map = BTreeMap(u32, u32, AutoContext(u32), .{ .B = 4 });
+
+    var map: Map = .empty;
+    defer map.deinit(testing.allocator);
+
+    for ([_]u32{ 1, 2, 3, 4, 5 }) |k| _ = try map.put(testing.allocator, k, k);
+
+    var begin = map.iterator();
+    var end = map.iterator();
+    for (0..5) |_| end.moveNext();
+
+    const removed = begin.removeUntilAndMovePrevious(testing.allocator, end);
+
+    try testing.expectEqual(5, removed);
+    try testing.expectEqual(null, begin.peek());
+    try testing.expectEqual(0, map.count());
+}
+
+// -------------------------------------------------------------------------------------------------
 // MARK: Ordering
 
 test "ascending, descending, and zig-zag produce the same map" {

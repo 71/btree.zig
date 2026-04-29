@@ -46,7 +46,7 @@ const Op = union(enum) {
     /// Remove the largest entry with `lastEntry().remove()`.
     remove_last_entry,
 
-    remove_and_move_next: struct { skip: u16, remove: u16 },
+    remove_and_move_next: struct { skip: u16, remove: u16, batch: bool },
     remove_and_move_previous: struct { skip: u16, remove: u16 },
 
     /// Keep entries whose key is below `ks[threshold]`.
@@ -65,7 +65,10 @@ const Op = union(enum) {
                 var payload: Payload = undefined;
                 inline for (@typeInfo(Payload).@"struct".fields) |f| {
                     @field(payload, f.name) =
-                        smith.valueRangeLessThan(f.type, 0, max_key);
+                        if (f.type == bool)
+                            smith.value(bool)
+                        else
+                            smith.valueRangeLessThan(f.type, 0, max_key);
                 }
                 break :blk @unionInit(Op, @tagName(t), payload);
             },
@@ -301,7 +304,14 @@ fn perform(
 
             for (0..skip) |_| it.moveNext();
 
-            for (0..args.remove) |_| {
+            if (args.batch) {
+                const remove = @min(args.remove, model.entries.items.len - skip);
+
+                for (0..remove) |_|
+                    _ = model.entries.orderedRemove(skip);
+
+                try testing.expectEqual(remove, it.removeUpToAndMoveNext(allocator, args.remove));
+            } else for (0..args.remove) |_| {
                 if (it.peek() == null) break;
 
                 const expected = model.entries.items[skip];

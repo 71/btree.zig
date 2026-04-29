@@ -1271,8 +1271,8 @@ pub fn BTreeMap(
                     // `pos` is the successor; move once to reach the predecessor.
                     if (wasLeaf) self.movePreviousUnchecked();
 
-                    // For internal nodes, `fixAfterRemovalAt()` walks up from the left subtree and
-                    // lands on `internal[idx]`, which is where we want to be.
+                    // For internal nodes, `rebalanceAfterRemovalAt()` walks up from the left
+                    // subtree and lands on `internal[idx]`, which is where we want to be.
                 } else {
                     // No successor: either the map is now empty, or we removed the last entry.
                     if (self.map.len == 0) {
@@ -1290,6 +1290,170 @@ pub fn BTreeMap(
                 self.gen = self.map.generation;
 
                 return kv;
+            }
+
+            /// Removes all entries from `self` (included) to `end` (excluded), moves `self` to the
+            /// entry directly after the removed range, and returns the number of removed entries.
+            ///
+            /// More efficient than calling `removeAndMoveNext()` in a loop.
+            ///
+            /// `self` and `end` must both be allocators of the same map, and `end` must be
+            /// positioned after `self`.
+            pub fn removeUntilAndMoveNext(
+                self: *Iterator,
+                allocator: Allocator,
+                end: Iterator,
+            ) usize {
+                // Knowing the number of entries ahead of time allows us to avoid comparisons as we
+                // walk the tree, so this function is a simple wrapper around `countBetween()` and
+                // `removeUpToAndMoveNext()`.
+                return self.removeUpToAndMoveNext(allocator, self.countBetween(&end));
+            }
+
+            /// Removes all entries from `self` (included) to `end` (excluded), moves `self` to the
+            /// entry directly before the removed range, and returns the number of removed entries.
+            ///
+            /// More efficient than calling `removeAndMoveNext()` in a loop.
+            ///
+            /// `self` and `end` must both be allocators of the same map, and `end` must be
+            /// positioned after `self`.
+            pub fn removeUntilAndMovePrevious(
+                self: *Iterator,
+                allocator: Allocator,
+                end: Iterator,
+            ) usize {
+                return self.removeUpToAndMovePrevious(allocator, self.countBetween(&end));
+            }
+
+            /// Removes up to `n` entries starting from `self`, moves `self` to the entry directly
+            /// after the removed range, and returns the number of actually removed entries.
+            ///
+            /// More efficient than calling `removeAndMoveNext()` `n` times.
+            pub fn removeUpToAndMoveNext(self: *Iterator, allocator: Allocator, n: usize) usize {
+                self.checkGeneration();
+
+                if (n == 0) return 0;
+                if (n == 1) {
+                    if (self.peek() == null) return 0;
+                    _ = self.removeAndMoveNext(allocator);
+                    return 1;
+                }
+                if (n >= self.map.len and self.idx == 0) {
+                    // We may be deleting the whole map. Don't bother rebalancing if we do.
+                    if (self.node.asLeaf()) |leaf| if (leaf.isFirst()) {
+                        const len = self.map.len;
+
+                        self.map.clear(allocator);
+                        self.node = .nil;
+                        self.idx = 0;
+                        self.gen = self.map.generation;
+
+                        return len;
+                    };
+                }
+
+                defer self.map.maybeCheckInvariantsNoContext();
+
+                // Eagerly bump generation.
+                self.map.bumpGeneration();
+
+                var remaining = n;
+
+                while (remaining > 0 and !self.node.isNil()) {
+                    if (self.node.asLeaf()) |leaf| {
+                        const available: u8 = leaf.len - self.idx;
+                        const batch: u8 = @intCast(@min(available, remaining));
+
+                        leaf.removeSlice(self.idx, batch);
+
+                        self.map.len -= batch;
+                        remaining -= batch;
+
+                        if (self.map.rebalanceAfterRemovalAt(allocator, .leaf(leaf), self.idx)) |p| {
+                            self.node = p.node;
+                            self.idx = p.idx;
+                        } else {
+                            self.node = .nil;
+                            self.idx = 0;
+                        }
+                    } else {
+                        self.map.len -= 1;
+                        remaining -= 1;
+
+                        const internal = self.node.assertInternal();
+                        const leaf = internal.children[self.idx].rightmostLeaf();
+
+                        assert(leaf.len >= 1);
+
+                        internal.keys[self.idx], internal.values[self.idx] = leaf.removeLast();
+
+                        if (self.map.rebalanceAfterRemovalAt(allocator, .leaf(leaf), leaf.len)) |p| {
+                            self.node = p.node;
+                            self.idx = p.idx;
+
+                            // Step past the predecessor's slot to reach the original successor.
+                            self.moveNextUnchecked();
+                        } else {
+                            self.node = .nil;
+                            self.idx = 0;
+                        }
+                    }
+                }
+
+                self.gen = self.map.generation;
+
+                return n - remaining;
+            }
+
+            /// Removes up to `n` entries starting from `self`, moves `self` to the entry directly
+            /// before the removed range, and returns the number of actually removed entries.
+            ///
+            /// More efficient than calling `removeAndMoveNext()` `n` times.
+            pub fn removeUpToAndMovePrevious(self: *Iterator, allocator: Allocator, n: usize) usize {
+                const removed = self.removeUpToAndMoveNext(allocator, n);
+
+                if (self.node.isNil()) {
+                    if (self.map.len > 0) {
+                        // Removed up to the end of the map; predecessor is the new last element.
+                        const leaf = self.map.root.orNull().?.rightmostLeaf();
+
+                        self.node = .leaf(leaf);
+                        self.idx = leaf.len - 1;
+                    } else {
+                        // The map is empty and `self` stays exhausted.
+                    }
+                } else {
+                    self.movePreviousUnchecked();
+                }
+
+                return removed;
+            }
+
+            /// Returns the number of entries between `self` (included) and `end` (excluded).
+            ///
+            /// `self` and `end` must both be allocators of the same map, and `end` must be
+            /// positioned after `self`.
+            pub fn countBetween(self: *const Iterator, end: *const Iterator) usize {
+                assert(self.map == end.map);
+
+                if (self.node.isNil()) {
+                    assert(end.node.isNil());
+                    assert(self.idx == 0);
+                    assert(end.idx == 0);
+                    return 0;
+                }
+
+                var n: usize = 0;
+                var it = self.*;
+
+                while (it.node.bits != end.node.bits or it.idx != end.idx) {
+                    assert(!it.node.isNil()); // `end` iterator is not after `self`.
+
+                    it.moveNextUnchecked();
+                    n += 1;
+                }
+
+                return n;
             }
 
             /// Removes the current entry, leaving it up to the caller to fix the iterator position.
@@ -1310,7 +1474,7 @@ pub fn BTreeMap(
 
                 if (node.asLeaf()) |leaf| {
                     kv.key, kv.value = leaf.remove(idx);
-                    removal = self.map.fixAfterRemovalAt(allocator, node, idx);
+                    removal = self.map.rebalanceAfterRemovalAt(allocator, node, idx);
                 } else {
                     const internal = node.assertInternal();
                     kv.key = internal.keys[idx];
@@ -1320,7 +1484,7 @@ pub fn BTreeMap(
                     assert(leaf.len >= 1);
 
                     internal.keys[idx], internal.values[idx] = leaf.removeLast();
-                    removal = self.map.fixAfterRemovalAt(allocator, .leaf(leaf), leaf.len);
+                    removal = self.map.rebalanceAfterRemovalAt(allocator, .leaf(leaf), leaf.len);
                 }
 
                 return .{ kv, removal };
@@ -1363,6 +1527,104 @@ pub fn BTreeMap(
                 it.moveNext();
 
                 try testing.expectEqual(null, it.asOccupiedEntry());
+            }
+
+            test removeUntilAndMoveNext {
+                // To keep things simple, only run this test for ascending key types.
+                if (sampleContextIsReversed(C)) return error.SkipZigTest;
+
+                const ks, const vs, const ctx = try testData();
+
+                var map: Self = .empty;
+                defer map.deinit(testing.allocator);
+
+                for (0..6) |i| _ = try map.putContext(testing.allocator, ks[i], vs[i], ctx);
+
+                var begin = map.iterator();
+                begin.moveNext();
+
+                var end = begin;
+                end.moveNext();
+                end.moveNext();
+
+                try testing.expectEqual(ks[3], end.peek().?[0].*);
+
+                const removed = begin.removeUntilAndMoveNext(testing.allocator, end);
+
+                try testing.expectEqual(2, removed);
+                try testing.expectEqual(ks[3], begin.peek().?[0].*);
+            }
+
+            test removeUntilAndMovePrevious {
+                // To keep things simple, only run this test for ascending key types.
+                if (sampleContextIsReversed(C)) return error.SkipZigTest;
+
+                const ks, const vs, const ctx = try testData();
+
+                var map: Self = .empty;
+                defer map.deinit(testing.allocator);
+
+                for (0..6) |i| _ = try map.putContext(testing.allocator, ks[i], vs[i], ctx);
+
+                var begin = map.iterator();
+                begin.moveNext();
+
+                var end = begin;
+                end.moveNext();
+                end.moveNext();
+
+                try testing.expectEqual(ks[3], end.peek().?[0].*);
+
+                const removed = begin.removeUntilAndMovePrevious(testing.allocator, end);
+
+                try testing.expectEqual(2, removed);
+                try testing.expectEqual(ks[0], begin.peek().?[0].*);
+            }
+
+            test countBetween {
+                const ks, const vs, const ctx = try testData();
+
+                var map: Self = .empty;
+                defer map.deinit(testing.allocator);
+
+                // Count between two exhausted iterators.
+                var begin = map.iterator();
+                var end = begin;
+
+                try testing.expectEqual(0, begin.countBetween(&end));
+
+                // Count between two iterators starting from the beginning.
+                _ = try map.putContext(testing.allocator, ks[0], vs[0], ctx);
+                _ = try map.putContext(testing.allocator, ks[1], vs[1], ctx);
+                _ = try map.putContext(testing.allocator, ks[2], vs[2], ctx);
+
+                begin = map.iterator();
+                end = begin;
+
+                end.moveNext();
+                try testing.expectEqual(1, begin.countBetween(&end));
+                end.moveNext();
+                try testing.expectEqual(2, begin.countBetween(&end));
+                end.moveNext();
+                try testing.expectEqual(3, begin.countBetween(&end));
+
+                // Count between two iterators with different origins.
+                end = map.iteratorFromEnd();
+                try testing.expectEqual(2, begin.countBetween(&end));
+                begin = map.iteratorFromEnd();
+                try testing.expectEqual(0, begin.countBetween(&end));
+
+                // Count also works with >B values.
+                for (3..B * 2) |i| _ = try map.putContext(testing.allocator, ks[i], vs[i], ctx);
+
+                begin = map.iterator();
+                end = map.iterator();
+
+                for (0..B * 2) |i| {
+                    try testing.expectEqual(i, begin.countBetween(&end));
+
+                    end.moveNext();
+                }
             }
         };
 
@@ -1605,14 +1867,35 @@ pub fn BTreeMap(
         ) void {
             var it = self.iterator();
 
+            var remove_start: ?Iterator = null;
+            var remove_count: usize = 0;
+
             while (it.peek()) |kv| {
                 const key_ptr, const value_ptr = kv;
 
                 if (f(context, key_ptr.*, value_ptr)) {
-                    it.moveNext();
+                    if (remove_start) |start| {
+                        const key_bits = key_ptr.*;
+
+                        it = start;
+                        _ = it.removeUpToAndMoveNext(allocator, remove_count);
+
+                        remove_start = null;
+                        remove_count = 0;
+
+                        assert(std.mem.eql(u8, @ptrCast(it.peek().?[0]), @ptrCast(&key_bits)));
+                    }
                 } else {
-                    _ = it.removeAndMoveNext(allocator);
+                    if (remove_start == null) remove_start = it;
+                    remove_count += 1;
                 }
+
+                it.moveNext();
+            }
+
+            if (remove_start) |start| {
+                it = start;
+                _ = it.removeUpToAndMoveNext(allocator, remove_count);
             }
         }
 
@@ -1846,6 +2129,22 @@ pub fn BTreeMap(
                 return .{ key, value };
             }
 
+            /// Removes `n` key-value pairs starting at `start_idx`.
+            fn removeSlice(self: *LeafNode, start_idx: u8, n: u8) void {
+                assert(start_idx + n <= self.len);
+
+                if (n == 0) return;
+
+                const end_idx = start_idx + n;
+                const len = self.len;
+                @memmove(self.keys[start_idx .. len - n], self.keys[end_idx..len]);
+                @memmove(self.values[start_idx .. len - n], self.values[end_idx..len]);
+                self.len -= n;
+
+                for (self.keys[len - n .. len]) |*k| k.* = undefined;
+                for (self.values[len - n .. len]) |*v| v.* = undefined;
+            }
+
             /// Removes the key-value pair at `self.len - 1`. Equivalent to, but more efficient
             /// than `self.remove(self.len - 1)`,
             fn removeLast(self: *LeafNode) struct { K, V } {
@@ -1857,6 +2156,22 @@ pub fn BTreeMap(
                 defer self.values[self.len] = undefined;
 
                 return .{ self.keys[self.len], self.values[self.len] };
+            }
+
+            /// Returns whether this node is the first one in its map. Equivalent to
+            /// `map.leftmostLeaf() == self`, but faster when this is false.
+            fn isFirst(self: *const LeafNode) bool {
+                if (self.parent_idx != 0) return false;
+
+                var parent = self.parent;
+
+                while (parent) |node| {
+                    if (node.parent_idx != 0) return false;
+
+                    parent = node.parent;
+                }
+
+                return true;
             }
         };
 
@@ -2294,7 +2609,7 @@ pub fn BTreeMap(
             if (ptr.asLeaf()) |leaf| {
                 const key, const value = leaf.remove(idx);
                 self.len -= 1;
-                self.fixAfterRemoval(allocator, ptr);
+                self.rebalanceAfterRemoval(allocator, ptr);
                 return .{ .key = key, .value = value };
             }
 
@@ -2307,25 +2622,25 @@ pub fn BTreeMap(
             assert(succ.len >= 1);
             node.keys[idx], node.values[idx] = succ.remove(0);
             self.len -= 1;
-            self.fixAfterRemoval(allocator, .leaf(succ));
+            self.rebalanceAfterRemoval(allocator, .leaf(succ));
 
             return .{ .key = key, .value = value };
         }
 
-        /// Iterator position returned by `fixAfterRemovalAt()`.
+        /// Iterator position returned by `rebalanceAfterRemovalAt()`.
         const Removal = struct { node: NodePtr, idx: u8 };
 
-        /// Same as `fixAfterRemoval()`, but returns the iterator position immediately after the
-        /// entry that was removed at `idx` from `ptr`. Returns `null` if the map is empty or the
-        /// removed entry was the last.
-        fn fixAfterRemovalAt(
+        /// Same as `rebalanceAfterRemoval()`, but returns the iterator position immediately after
+        /// the entry that was removed at `idx` from `ptr`. Returns `null` if the map is empty or
+        /// the removed entry was the last.
+        fn rebalanceAfterRemovalAt(
             self: *Self,
             allocator: Allocator,
             ptr: NodePtr,
             idx: u8,
         ) ?Removal {
             var removal: RemovalLeaf = .{ .leaf = ptr.assertLeaf(), .idx = idx };
-            self.fixAfterRemovalImpl(allocator, ptr, &removal);
+            self.rebalance(allocator, ptr, &removal);
 
             if (self.len == 0) return null;
 
@@ -2345,15 +2660,18 @@ pub fn BTreeMap(
         }
 
         /// Fixes a node after removing a key-value pair from it.
-        fn fixAfterRemoval(self: *Self, allocator: Allocator, ptr: NodePtr) void {
-            self.fixAfterRemovalImpl(allocator, ptr, null);
+        fn rebalanceAfterRemoval(self: *Self, allocator: Allocator, ptr: NodePtr) void {
+            self.rebalance(allocator, ptr, null);
         }
 
-        /// Leaf tracked by `fixAfterRemovalImpl()`.
+        /// Leaf tracked by `rebalance()`.
         const RemovalLeaf = struct { leaf: *LeafNode, idx: u8 };
 
-        /// Implementation of `fixAfterRemoval()` and `fixAfterRemovalAt()`.
-        fn fixAfterRemovalImpl(
+        /// Implementation of `rebalanceAfterRemoval()` and `rebalanceAfterRemovalAt()`.
+        ///
+        /// `current` may be missing more than one key (e.g. after `removeSlice()`), in which case
+        /// rotations are repeated until `current.len() >= min_keys` or merging is required.
+        fn rebalance(
             self: *Self,
             allocator: Allocator,
             ptr: NodePtr,
@@ -2361,9 +2679,9 @@ pub fn BTreeMap(
         ) void {
             var current = ptr;
 
-            // Whether we entered processed a leaf; we should only process leaves once, so this
-            // ensures we don't enter an infinite loop below.
-            var processed_leaf = if (options.check_invariants) false else {};
+            // Whether the leaf has been merged away. Once that happens, only internal nodes are
+            // processed by the rest of the loop.
+            var merged_leaf = if (options.check_invariants) false else {};
 
             while (current.parent()) |parent| {
                 if (current.len() >= min_keys) return; // No need to fix.
@@ -2380,7 +2698,7 @@ pub fn BTreeMap(
                     if (right.len() > min_keys) {
                         // Leaves have the same depth, so if `left` is a leaf, then so is `right`.
                         if (current.asLeaf()) |left| {
-                            if (options.check_invariants) assert(!processed_leaf);
+                            if (options.check_invariants) assert(!merged_leaf);
 
                             parent.rotateLeafLeft(left, current_idx, right.assertLeaf());
 
@@ -2389,7 +2707,9 @@ pub fn BTreeMap(
                         } else {
                             parent.rotateInternalLeft(current.assertInternal(), current_idx, right.assertInternal());
                         }
-                        return;
+
+                        // After batch removal `current` may still have `< min_keys` entries.
+                        continue;
                     }
                 }
 
@@ -2399,7 +2719,7 @@ pub fn BTreeMap(
 
                     if (left.len() > min_keys) {
                         if (current.asLeaf()) |r| {
-                            if (options.check_invariants) assert(!processed_leaf);
+                            if (options.check_invariants) assert(!merged_leaf);
 
                             parent.rotateLeafRight(left.assertLeaf(), current_idx - 1, r);
 
@@ -2408,7 +2728,7 @@ pub fn BTreeMap(
                         } else {
                             parent.rotateInternalRight(left.assertInternal(), current_idx - 1, current.assertInternal());
                         }
-                        return;
+                        continue;
                     }
                 }
 
@@ -2417,8 +2737,8 @@ pub fn BTreeMap(
 
                 if (current.isLeaf()) {
                     if (options.check_invariants) {
-                        assert(!processed_leaf);
-                        processed_leaf = true;
+                        assert(!merged_leaf);
+                        merged_leaf = true;
                     }
 
                     // Fix up cursor if needed.
@@ -2753,6 +3073,16 @@ pub fn BTreeMap(
                 pub fn removeAndMovePrevious(self: *@This()) Managed.KV {
                     const managed: *Managed = .fromUnmanaged(self.unmanaged.map);
                     return self.unmanaged.removeAndMovePrevious(managed.allocator);
+                }
+
+                pub fn removeUntilAndMoveNext(self: *@This(), end: @This()) usize {
+                    const managed: *Managed = .fromUnmanaged(self.unmanaged.map);
+                    return self.unmanaged.removeUntilAndMoveNext(managed.allocator, end.unmanaged);
+                }
+
+                pub fn removeUntilAndMovePrevious(self: *@This(), end: @This()) usize {
+                    const managed: *Managed = .fromUnmanaged(self.unmanaged.map);
+                    return self.unmanaged.removeUntilAndMovePrevious(managed.allocator, end.unmanaged);
                 }
             };
 
