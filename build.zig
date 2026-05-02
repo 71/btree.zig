@@ -21,7 +21,13 @@ pub fn build(b: *std.Build) void {
     const test_filter = b.option([]const u8, "test-filter", "") orelse "";
     const test_filters = [_][]const u8{test_filter};
     const tests = b.addTest(.{
-        .root_module = mod,
+        // We don't use `mod` as the root module so the module we expose doesn't need to import or
+        // compile tests.
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
         .filters = if (test_filter.len == 0) &.{} else &test_filters,
     });
 
