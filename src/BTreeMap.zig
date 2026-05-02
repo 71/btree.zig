@@ -13,10 +13,6 @@ pub const Options = struct {
     /// Capacity of each leaf. Must be in 4..<255.
     B: usize = 16,
 
-    /// Type of search to use to find nodes. If `null`, picks the one that seems the most
-    /// appropriate for `K`.
-    search: ?enum { binary, linear } = null,
-
     /// Whether the map should call `checkInvariants()` after each mutation. This should typically
     /// be left as `false`.
     ///
@@ -81,13 +77,6 @@ pub fn BTreeMap(
 
     // We store `B + 1` and compute lengths as `u8`, so `B` must be `< 255`.
     comptime if (options.B >= 255) @compileError("B must be < 255");
-
-    const linear_search = if (options.search) |search|
-        search == .linear
-    else if (@hasDecl(C, "prefer_linear_search"))
-        C.prefer_linear_search
-    else
-        false;
 
     // We support tracking iterator generations.
     const track_generation = options.track_generations;
@@ -2487,16 +2476,13 @@ pub fn BTreeMap(
         fn search(context: anytype, keys: []const K, key: anytype) struct { u8, bool } {
             assert(keys.len <= B);
 
-            if (linear_search) {
-                for (keys, 0..) |k, i| {
-                    switch (context.order(k, key)) {
-                        .lt => {},
-                        .eq => return .{ @intCast(i), true },
-                        .gt => return .{ @intCast(i), false },
-                    }
-                }
-                return .{ @intCast(keys.len), false };
-            } else {
+            if (@hasDecl(@TypeOf(context), "search")) {
+                return context.search(keys, key);
+            } else if (@hasDecl(@TypeOf(context), "order")) {
+                // We're in a binary tree and we can't make assumptions about what `context.order()`
+                // does, so we'll use a binary search. In many cases a linear search will be faster,
+                // but that's the responsibility of the caller to provide a proper context with
+                // `search()`.
                 var lo: u16 = 0;
                 var hi: u16 = @intCast(keys.len);
                 while (lo < hi) {
@@ -2510,6 +2496,8 @@ pub fn BTreeMap(
                     }
                 }
                 return .{ @intCast(lo), false };
+            } else {
+                @compileError("C must define `fn order(@This(), K, anytype) Order` or `fn search(@This(), []const K, K) SearchResult`");
             }
         }
 
@@ -2517,6 +2505,29 @@ pub fn BTreeMap(
         inline fn searchIndex(context: anytype, keys: []const K, key: anytype) ?u8 {
             const index, const found = search(context, keys, key);
             return if (found) index else null;
+        }
+
+        /// Returns the ordering between `a` and `b`.
+        fn order(context: anytype, a: K, b: anytype) Order {
+            if (@hasDecl(@TypeOf(context), "order")) {
+                return context.order(a, b);
+            } else if (@hasDecl(@TypeOf(context), "search")) {
+                // We can determine the ordering of `a` and `b` using `search()`.
+                const index, const found = context.search([]const K{a}, b);
+
+                if (found) {
+                    assert(index == 0);
+                    return .eq;
+                }
+                if (index == 1) {
+                    // `b` should be inserted after `a`, so `a < b`.
+                    return .lt;
+                }
+                assert(index == 0);
+                return .gt;
+            } else {
+                @compileError("C must define `fn order(@This(), K, anytype) Order` or `fn search(@This(), []const K, K) SearchResult`");
+            }
         }
 
         // -----------------------------------------------------------------------------------------
@@ -3128,26 +3139,31 @@ pub fn BTreeMap(
 // -------------------------------------------------------------------------------------------------
 // MARK: AutoContext
 
+/// The result of a search function: given `keys, key`, the first value should be the index `i` of
+/// the first key in `keys` such that `keys[i] >= key`, and the second value should be whether
+/// `keys[i] == key`.
+pub const SearchResult = struct { u8, bool };
+
 /// Returns a type which can be used as `Context` in `BTreeMap` for trivially comparable types:
 ///
 /// - `bool`, `enum`s, integers, and floats.
 /// - Slices and arrays thereof.
 pub fn AutoContext(comptime K: type) type {
-    const linear_search_max_bytes = 512;
-
     return switch (@typeInfo(K)) {
         .pointer => |ptr| blk: {
             comptime checkAutoContextScalar(ptr.child);
 
             break :blk switch (ptr.size) {
                 .one => struct {
-                    pub const prefer_linear_search: bool = @sizeOf(K) <= linear_search_max_bytes;
+                    pub const search = getAutoSearchFn(K, @This());
 
                     pub fn order(_: @This(), a: K, b: K) Order {
                         return std.math.order(a.*, b.*);
                     }
                 },
                 .slice => struct {
+                    pub const search = getAutoSearchFn(K, @This());
+
                     pub fn order(_: @This(), a: K, b: K) Order {
                         return std.mem.order(ptr.child, a, b);
                     }
@@ -3158,6 +3174,8 @@ pub fn AutoContext(comptime K: type) type {
                             @compileError("a pointer of an unknown size may not be used with AutoContext");
                         if (sentinel != 0) @compileError("only 0 may be used as a sentinel in AutoContext");
                     }
+
+                    pub const search = getAutoSearchFn(K, @This());
 
                     pub fn order(_: @This(), a: K, b: K) Order {
                         return std.mem.orderZ(ptr.child, a, b);
@@ -3172,7 +3190,7 @@ pub fn AutoContext(comptime K: type) type {
                 checkAutoContextScalar(array.child);
             }
 
-            pub const prefer_linear_search: bool = @sizeOf(K) <= linear_search_max_bytes;
+            pub const search = getAutoSearchFn(K, @This());
 
             pub fn order(_: @This(), a: K, b: K) Order {
                 return std.mem.order(array.child, a, b);
@@ -3199,6 +3217,254 @@ fn checkAutoContextScalar(comptime t: type) void {
         .bool, .@"enum", .int, .float => {},
         else => @compileError("type " ++ @typeName(t) ++ " cannot be used in AutoContext"),
     }
+}
+
+/// Returns a `BTreeMap` context which orders values in reverse order from `Context`.
+pub fn ReversedContext(comptime Context: type) type {
+    if (@hasDecl(Context, "Reversed")) return Context.Reversed;
+
+    const K = @typeInfo(@TypeOf(Context.order)).@"fn".params[1].type orelse
+        @compileError(@typeName(Context) ++ " must define `fn order(@This(), K, K|anytype) std.math.Order`");
+
+    if (@hasDecl(Context, "searchRev")) {
+        // Use the built-in reverse search of `Context`.
+        return struct {
+            pub const Reversed = Context;
+
+            reversed: Context,
+
+            pub fn order(self: @This(), a: K, b: K) Order {
+                return self.reversed.order(b, a);
+            }
+
+            pub fn search(self: @This(), keys: []const K, key: K) SearchResult {
+                return self.reversed.searchRev(keys, key);
+            }
+
+            pub fn searchRev(self: @This(), keys: []const K, key: K) SearchResult {
+                return self.reversed.search(keys, key);
+            }
+        };
+    }
+
+    // `Context` doesn't have a reversed search, so we use a reversed `order()` function instead.
+    return struct {
+        pub const Reversed = Context;
+
+        reversed: Context,
+
+        pub fn order(self: @This(), a: K, b: K) Order {
+            return self.reversed.order(b, a);
+        }
+
+        pub fn searchRev(self: @This(), keys: []const K, key: K) SearchResult {
+            return self.reversed.search(keys, key);
+        }
+    };
+}
+
+/// Returns a `BTreeMap` context which uses the raw bitwise representation of keys for comparisons.
+///
+/// This requires `K` to have no padding bytes.
+pub fn BitwiseContext(comptime K: type) type {
+    // In theory `K` may be too large to fit in SIMD vectors, in which case we'd fallback to plain
+    // comparisons here. For now we don't care and always use SIMD, though.
+    return SimdContext(K);
+}
+
+/// Returns a `BTreeMap` context which uses SIMD over the raw bitwise representation of keys for
+/// comparisons.
+///
+/// This requires `K` to have no padding bytes.
+pub fn SimdContext(comptime K: type) type {
+    assert(@bitSizeOf(K) == @sizeOf(K) * 8);
+
+    return struct {
+        pub fn order(_: @This(), a: K, b: K) Order {
+            return std.mem.order(u8, @ptrCast(&a), @ptrCast(&b));
+        }
+
+        pub fn search(_: @This(), keys: []const K, key: K) SearchResult {}
+
+        pub fn searchRev(_: @This(), keys: []const K, key: K) SearchResult {}
+    };
+}
+
+/// Returns a context type which defines a `search()` function, as expected by `BTreeMap`, defined
+/// using a linear search with `Context.order()`.
+pub fn WithLinearSearch(comptime Context: type) type {
+    const K = KeyType(Context);
+
+    return struct {
+        inner: Context,
+
+        pub fn init(context: Context) @This() {
+            return .{ .inner = context };
+        }
+
+        pub fn order(self: @This(), a: K, b: K) Order {
+            return self.inner.order(a, b);
+        }
+
+        pub fn search(self: @This(), keys: []const K, key: K) SearchResult {
+            for (keys, 0..) |k, i| {
+                switch (self.inner.order(k, key)) {
+                    .eq => return .{ @intCast(i), true },
+                    .gt => return .{ @intCast(i), false },
+                    .lt => continue,
+                }
+            }
+            return .{ @intCast(keys.len), false };
+        }
+
+        pub fn searchRev(self: @This(), keys: []const K, key: K) SearchResult {
+            for (keys, 0..) |k, i| {
+                switch (self.inner.order(key, k)) {
+                    .eq => return .{ @intCast(i), true },
+                    .gt => return .{ @intCast(i), false },
+                    .lt => continue,
+                }
+            }
+            return .{ @intCast(keys.len), false };
+        }
+    };
+}
+
+/// Returns a context type which defines a `search()` function, as expected by `BTreeMap`, defined
+/// using a binary search with `Context.order()`.
+pub fn WithBinarySearch(comptime Context: type) type {
+    const K = KeyType(Context);
+
+    return struct {
+        inner: Context,
+
+        pub fn init(context: Context) @This() {
+            return .{ .inner = context };
+        }
+
+        pub fn order(self: @This(), a: K, b: K) Order {
+            return self.inner.order(a, b);
+        }
+
+        pub fn search(self: @This(), keys: []const K, key: K) SearchResult {
+            var lo: u16 = 0;
+            var hi: u16 = @intCast(keys.len);
+            while (lo < hi) {
+                // No need for an overflow trick here, `len` is always low enough.
+                const mid = lo + (hi - lo) / 2;
+
+                switch (self.inner.order(keys[mid], key)) {
+                    .lt => lo = mid + 1,
+                    .eq => return .{ @intCast(mid), true },
+                    .gt => hi = mid,
+                }
+            }
+            return .{ @intCast(lo), false };
+        }
+
+        pub fn searchRev(self: @This(), keys: []const K, key: K) SearchResult {
+            var lo: u16 = 0;
+            var hi: u16 = @intCast(keys.len);
+            while (lo < hi) {
+                // No need for an overflow trick here, `len` is always low enough.
+                const mid = lo + (hi - lo) / 2;
+
+                switch (self.inner.order(key, keys[mid])) {
+                    .lt => lo = mid + 1,
+                    .eq => return .{ @intCast(mid), true },
+                    .gt => hi = mid,
+                }
+            }
+            return .{ @intCast(lo), false };
+        }
+    };
+}
+
+/// Returns a search function
+pub fn getLinearSearchFn(
+    comptime K: type,
+    comptime Context: type,
+) fn (Context, []const K, K) SearchResult {
+    return struct {
+        fn f() {
+
+        }
+    }.f;
+}
+
+/// Returns
+pub fn getBinarySearchFn(
+    comptime K: type,
+    comptime Context: type,
+) fn (Context, []const K, K) SearchResult {}
+
+/// Returns
+pub fn getAutoSearchFn(
+    comptime K: type,
+    comptime Context: type,
+) fn (Context, []const K, K) SearchResult {
+    const linear_search_max_bytes = 512;
+    const prefer_linear_search: bool = @sizeOf(K) <= linear_search_max_bytes;
+
+    return if (prefer_linear_search) getLinearSearchFn(K, Context) else getBinarySearchFn(K, Context);
+}
+
+///
+pub fn getBitwiseSearchFn(comptime K: type) fn (anytype, []const K, K) SearchResult {
+    return getSimdSearchFn(K);
+}
+
+///
+pub fn getSimdSearchFn(comptime K: type) fn (anytype, []const K, K) SearchResult {
+    const U = @Int(.unsigned, @bitSizeOf(K));
+    const len = std.simd.suggestVectorLength(U);
+    const V = @Vector(len, U);
+
+    const key_bits: U = @bitCast(key);
+    const key_vector: V = @splat(key_bits);
+    const keys_bits: []const U = @ptrCast(keys);
+
+    var i = 0;
+
+    while (i + len <= keys.len) : (i += len) {
+        const keys_vector: V = keys_bits[i .. i + len];
+        const first_le = std.simd.firstTrue(key_vector <= keys_vector) orelse continue;
+
+        return .{ first_le, key_bits == keys_bits[first_le] };
+    }
+
+    while (i < keys.len) : (i += 1) {
+        if (key_bits == keys_bits[i]) return .{ i, true };
+        if (key_bits > keys_bits[i]) return .{ i, false };
+    }
+
+    return .{ keys.len, false };
+}
+
+fn hasPadding(comptime T: type) bool {
+    if (@bitSizeOf(T) != @sizeOf(T) * 8) return true;
+
+    return switch (@typeInfo(T)) {
+        .void, .int, .float, .pointer, .error_set, .@"enum", .@"fn", .vector => false,
+        .array => |a| hasPadding(a.child),
+        .@"struct" => |s| {
+            var fields_bits: usize = 0;
+            for (s.fields) |f| {
+                if (f.alignment) |alignment| if (alignment > @alignOf(T)) return false;
+                fields_bits += @bitSizeOf(f.type);
+            }
+            return fields_bits == @bitSizeOf(T);
+        },
+        .@"union" => |u| {
+            for (u.fields) |f| {
+                if (f.alignment) |alignment| if (alignment > @alignOf(T)) return false;
+                if (@bitSizeOf(f.type) != @bitSizeOf(T)) return false;
+            }
+            return true;
+        },
+        .optional => |o| @typeInfo(o.child) != .pointer,
+        else => true,
+    };
 }
 
 // -------------------------------------------------------------------------------------------------
